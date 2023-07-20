@@ -1,0 +1,174 @@
+// © fab.arciniegas@gmail.com
+// Fabio Arciniegas 2023
+//@version=5
+
+// Approximate with code the visual process of identifying support and resistance levels
+// by assigning resistance close to "the level that touches most peaks"
+//
+// Technically, we identify high pivots for candidate "peaks" and low pivots for "valleys"
+// After identifying all pivots of either type we determine the minimum and maximum 
+// and divide the distance between them in n bins.
+// 
+// Following the creation of this histogram we simply see which bin has the most pivots and decide
+// to suggest a level at the middle of said bin.
+//
+// Note:
+// 
+// A high pivot most have a number of lower highs before and after itself in order to be considered a true pivot
+// (https://www.tradingview.com/pine-script-docs/en/v4/essential/Drawings.html#pivot-points-high-low)
+indicator("Resistance & Support by Binning Pivots", overlay = true)
+
+int legsInput = input(3,"Pivot Bars", group="Settings 🔨",
+     tooltip="The number of lower highs before and after a point in order to be considered a true pivot\n")
+int binsInput = input(6,"Number of bins",group="Settings 🔨",
+     tooltip="The number of bins in the histogram we will use for pivots\n")
+bool weighInput = input(true,"Favor most recent pivots",group="Settings 🔨")
+
+bool drawPivotLines = input(true,"Draw Line connecting Pivots",group="Appearance")
+bool textBinInput = input(false,"Label bin with number of pivots",group="Appearance")
+bool labelPivotsInput = input(false,"Label each pivot with price",group="Appearance")
+bool iconPivotsInput = input(false,"Label each pivot with icon",group="Appearance")
+color pivotLineColor = input(color.gray,"Pivot line color",group="Appearance")
+color binColor = input(color.rgb(100,100,100,80) , "Bin Color",group="Appearance")
+color binLineColor = input(color.rgb(72, 34, 34), "Bin Line Color",group="Appearance")
+
+string pivotStyleOption = input.string("dotted (┈)", title="Pivot Line Style",
+     options=["solid (─)", "dotted (┈)", "dashed (╌)"])
+string binStyleOption = input.string("dashed (╌)", title="Resistance Line Style",
+     options=["solid (─)", "dotted (┈)", "dashed (╌)"])
+pivotLineStyle = pivotStyleOption == "dotted (┈)" ? line.style_dotted :
+     pivotStyleOption == "dashed (╌)" ? line.style_dashed :
+     line.style_solid
+resistanceLineStyle = binStyleOption == "dotted (┈)" ? line.style_dotted :
+     binStyleOption == "dashed (╌)" ? line.style_dashed :
+     line.style_solid
+
+bool debugToolTip = input(false,"Show internals as label", group="Internals")
+
+
+// Define the `pivotPoint` UDT containing the time and price of pivots.
+type pivotPoint
+    int openTime
+    float level
+
+var pivotHighArray = array.new<pivotPoint>()
+var pivotLowArray = array.new<pivotPoint>()
+
+// Detect new pivots (`na` is returned when no pivot is found).
+pivotHigh = ta.pivothigh(high, legsInput)
+pivotLow = ta.pivotlow(low, legsInput)
+
+// Add a new `pivotPoint` object to the end of the array for each detected pivot.
+// IFF it is visible in the current view. This not only makes it way faster but much more meaningful and intuitive
+if time[legsInput] >= chart.left_visible_bar_time and time <= chart.right_visible_bar_time
+    if not na(pivotHigh) 
+        newPivot = pivotPoint.new(time[legsInput], pivotHigh)
+        array.push(pivotHighArray, newPivot)
+    if not na(pivotLow) 
+        newPivot = pivotPoint.new(time[legsInput], pivotLow)
+        array.push(pivotLowArray, newPivot)
+    
+
+extractPricesOnly(pivots) =>
+    var priceOnly = array.new<float>()
+    for p in pivots
+        array.push(priceOnly,p.level)
+    priceOnly
+
+binArray(values,numBins,apply_weight,weight) =>
+    var bins = array.new<float>(numBins,0)
+    var max = array.max(values)
+    var min = array.min(values)
+    var binSize = (max - min)/numBins
+    float i = 0.0
+    for v in values
+        bin = math.floor((v-min)/binSize)
+        if bin == array.size(bins)
+            bin := bin - 1
+        array.set(bins,bin,array.get(bins,bin)+1+i)
+        if weighInput
+            i := i + weight
+    [bins,max,min,binSize]
+
+var float resistance = na
+var float support = na
+
+drawBin(bins,binSize,min,high)=>
+    modeBin = array.indexof(bins,array.max(bins))
+    bottomOfBin = modeBin * binSize + min
+    topOfBin = bottomOfBin + binSize
+    middleOfBin = bottomOfBin + binSize/2
+        // Draw resistance as a line
+    line.new(x1=chart.left_visible_bar_time, y1=middleOfBin,
+             x2=chart.right_visible_bar_time,y2=middleOfBin,
+             xloc=xloc.bar_time, color=binLineColor,
+             style=resistanceLineStyle,width=2)
+
+    // TODO: Debug print the other bins. for eachBinBottom in bottoms()
+    highBoxText = "contains " + str.tostring(int(array.max(bins))) + (high ? " high pivot" : " low pivot") + (int(array.max(bins)) > 1 ? "s" : "")
+    // Draw bounding bin as a box, with an optional label
+    box.new(left=chart.left_visible_bar_time, top=topOfBin, right=chart.right_visible_bar_time, 
+             bottom=bottomOfBin, border_width=0,xloc=xloc.bar_time,bgcolor=binColor,
+             text=textBinInput ? highBoxText : "", text_color=color.blue , 
+             text_size=size.small,text_valign=text.align_bottom)
+    middleOfBin
+
+// On the last historical bar only, draw resistance, pivot lines
+if barstate.islastconfirmedhistory
+    highPivotPrices = extractPricesOnly(pivotHighArray)
+    [bins,max,min,binSize] = binArray(highPivotPrices,binsInput,weighInput,0.001)
+    resistance := drawBin(bins,binSize,min,true)
+    
+    lowPivotPrices = extractPricesOnly(pivotLowArray)
+    [lbins,lmax,lmin,lbinSize] = binArray(lowPivotPrices,binsInput,weighInput,0.001)
+    support := drawBin(lbins,lbinSize,lmin,false)
+
+    var pivotPoint previousPoint = na 
+    for eachPivot in pivotHighArray
+        if labelPivotsInput
+            label.new(eachPivot.openTime, eachPivot.level, str.tostring(eachPivot.level, format.mintick), xloc.bar_time, textcolor = color.white)
+        // Create a line between pivots.
+        if not na(previousPoint) and drawPivotLines
+            // Only create a line starting at the loop's second iteration because lines connect two pivots.
+            line.new(previousPoint.openTime, previousPoint.level, eachPivot.openTime, 
+                 eachPivot.level, xloc= xloc.bar_time,color=pivotLineColor,
+                 style=pivotLineStyle)
+        if iconPivotsInput
+            label.new(eachPivot.openTime,eachPivot.level,text="⤵",xloc=xloc.bar_time,color=color.rgb(0,0,0,100),yloc=yloc.abovebar,textcolor=color.blue)
+        // Save the pivot for use in the next iteration.
+        previousPoint := eachPivot
+    previousPoint := na
+    for eachPivot in pivotLowArray
+        if labelPivotsInput
+            label.new(eachPivot.openTime, eachPivot.level, str.tostring(eachPivot.level, format.mintick), xloc.bar_time, textcolor = color.white, style=label.style_label_down)
+        // Create a line between pivots.
+        if not na(previousPoint) and drawPivotLines
+            // Only create a line starting at the loop's second iteration because lines connect two pivots.
+            line.new(previousPoint.openTime, previousPoint.level, eachPivot.openTime, 
+                 eachPivot.level, xloc= xloc.bar_time,color=pivotLineColor,
+                 style=pivotLineStyle)
+        if iconPivotsInput
+            label.new(eachPivot.openTime,eachPivot.level,text="⤴",xloc=xloc.bar_time,color=color.rgb(0,0,0,100),yloc=yloc.belowbar,textcolor=color.blue)
+        // Save the pivot for use in the next iteration.
+        previousPoint := eachPivot
+
+
+
+    msg = "Candidate High Pivots: " + str.tostring(array.size(pivotHighArray)) + "\n" 
+         + "Time of first High Pivot: " + str.format_time(array.first(pivotHighArray).openTime) + "\n"
+         + "Time of first Low Pivot: " + str.format_time(array.first(pivotLowArray).openTime) + "\n"
+         + "Highest High Pivot: " + str.tostring(max) + "\nLowest High Pivot: " + str.tostring(min) + "\n" 
+         + "Number of bins:" + str.tostring(binsInput) + "\n"
+         + "Histogram of high pivots: " + str.tostring(bins) + "\n"
+         + "Histogram of low pivots: " + str.tostring(lbins) + "\n"
+         + "(decimal points present when giving more weight to more recent pivots)" + "\n"
+         + "Resistance at:" +str.tostring(resistance) + "\n"
+         + "Support at:" +str.tostring(support)
+    if debugToolTip
+        label.new(int(chart.left_visible_bar_time + (chart.right_visible_bar_time - chart.left_visible_bar_time)/2), close, msg, xloc.bar_time, textcolor = color.gray, color=color.black,textalign = text.align_left,style = label.style_none)
+
+
+
+// Although we already painted the actual line in the graph, we still wan the data window to show the value of the resistance
+plot(resistance,title="Resistance" , color=binLineColor, linewidth=0, style=plot.style_line, trackprice=true, show_last=1)
+plot(support,title="Support" , color=binLineColor, linewidth=0, style=plot.style_line, trackprice=true, show_last=1)
